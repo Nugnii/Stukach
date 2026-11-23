@@ -1,7 +1,20 @@
-import type { EngineInterface, Register } from 'claude-code'
+import { atom, read, update } from 'claude-code'
+import type { Elements, EngineInterface, Register } from 'claude-code'
 
 import { ago, describeCall, familyOf, finishedIn, parseHead, parseOr, parseTail, roleOf, scanBackground, shortModel, stateOf } from './board'
 import type { Background, BgMemo, Role, State, Tail, Wait } from './board'
+import { columnsSvg, columnsText } from './charts'
+import type { Column } from './charts'
+import { ledgerRefresh, ledgerTick, ledgerView } from './ledger'
+import { dateShort, limitWeeks, money, payMonths, sumHours, workTime } from './stats'
+import type { Hours, Period } from './stats'
+import { BAR, CONFIRM_MS, LIMIT_LABEL, cacheLeftMs, coldText, decide, rank, rereadUsd, tokens, usd, weather } from './weather'
+import type { Armed, CacheMark } from './weather'
+
+const cacheRef = atom({ plugin: 'stukach', key: 'cache' } as const, null as CacheMark | null)
+const armedRef = atom({ plugin: 'stukach', key: 'armed' } as const, null as Armed | null)
+const expandedRef = atom({ plugin: 'stukach', key: 'expanded' } as const, false)
+const gearRef = atom({ plugin: 'stukach', key: 'gear' } as const, false)
 
 const PANE = 'stukach'
 const TITLE = 'Помощники'
@@ -30,6 +43,7 @@ const appIds = new Map<string, string>() // запись приложения lo
 const waiting = new Map<string, Wait>() // ожидания разрешения в ЭТОЙ сессии, по агенту
 let me = ''
 let waitFile = ''
+let home = ''
 
 async function head($: $, path: string) {
   let h = heads.get(path)
@@ -141,7 +155,44 @@ async function ensureMe($: $) {
   if (me) return
   const info = await $.session.info()
   me = info.transcriptPath.split('/').pop()!.replace(/\.jsonl$/, '')
-  waitFile = `${await $.env.get('HOME')}/.claude/stukach/waits/${me}.json`
+  home = (await $.env.get('HOME')) ?? ''
+  waitFile = `${home}/.claude/stukach/waits/${me}.json`
+}
+
+// Настройки — файл, общий для всех окон: галочка, снятая в одном, снята во всех.
+type Settings = { weather: boolean; stats: boolean; helpers: boolean; price: number }
+const DEFAULTS: Settings = { weather: true, stats: true, helpers: true, price: 200 }
+let settings: Settings = DEFAULTS
+let settingsMtime = -1
+const settingsFile = () => `${home}/.claude/stukach/settings.json`
+
+async function settingsOf($: $): Promise<Settings> {
+  await ensureMe($)
+  const st = await $.fs.stat(settingsFile()).catch(() => undefined)
+  if (!st) return (settings = DEFAULTS)
+  if (st.mtimeMs !== settingsMtime) {
+    settings = { ...DEFAULTS, ...parseOr<Partial<Settings>>(await $.fs.read(settingsFile()).catch(() => ''), {}) }
+    settingsMtime = st.mtimeMs
+  }
+  return settings
+}
+
+async function saveSettings($: $, patch: Partial<Settings>) {
+  settings = { ...(await settingsOf($)), ...patch }
+  await $.fs.write(settingsFile(), JSON.stringify(settings))
+  settingsMtime = -1
+  $.ui.invalidate('ui.render')
+}
+
+// День оплаты подписки — из учётки Claude Code (oauthAccount.subscriptionCreatedAt); без подписки — 1-е число.
+let pay: { day: number; isSub: boolean } | undefined
+async function payDayOf($: $) {
+  if (!pay) {
+    const text = await $.fs.read(`${home}/.claude.json`).catch(() => '')
+    const at = Date.parse(/"subscriptionCreatedAt":\s*"([^"]+)"/.exec(text)?.[1] ?? '')
+    pay = at ? { day: new Date(at).getDate(), isSub: true } : { day: 1, isSub: false }
+  }
+  return pay
 }
 
 async function writeWaits($: $) {
@@ -258,11 +309,41 @@ function actionLine(t: Tail, now: number): string {
   return `${a.isPending ? 'сейчас' : 'последнее'}: ${a.tool}${a.what ? ` — ${a.what}` : ''} · ${ago(now - a.ts)} назад`
 }
 
+const HOUR = 3_600_000
+const plural = (n: number, forms: [string, string, string]) => {
+  const k = n % 100, j = n % 10
+  return k > 10 && k < 20 ? forms[2] : j === 1 ? forms[0] : j >= 2 && j <= 4 ? forms[1] : forms[2]
+}
+// «сколько времени сэкономили агенты» — в рабочих днях человека
+const workDays = (ms: number) => {
+  const d = Math.round(ms / (8 * HOUR))
+  return d >= 1 ? ` ≈ ${d} ${plural(d, ['рабочий день', 'рабочих дня', 'рабочих дней'])} по 8 ч` : ''
+}
+const timesPrice = (usd: number, price: number) =>
+  price > 0 && usd > 0 ? ` · ×${(usd / price).toFixed(usd / price >= 10 ? 0 : 1)} к цене подписки ($${price})` : ''
+const firstHour = (h: Hours) => Math.min(...Object.keys(h).map(Number)) * HOUR // Infinity, пока учёт пуст
+
+/** Периоды с данными: столбцы стоимости и часов и строки таблицы; периоды раньше начала учёта не показываются. */
+function columnsOf(hours: Hours, periods: Period[], label: (p: Period) => string, now: number) {
+  const start = firstHour(hours)
+  const rows = periods.filter(p => p.to > start).map(p => ({ p, t: sumHours(hours, p.from, p.to), isCurrent: p.from <= now && now < p.to }))
+  const usdCols: Column[] = rows.map(({ p, t, isCurrent }) => ({ label: label(p), value: t.usd, isCurrent, tip: `${label(p)}: ${money(t.usd)} по ценам API` }))
+  const hourCols: Column[] = rows.map(({ p, t, isCurrent }) => ({ label: label(p), value: t.ms / HOUR, isCurrent, tip: `${label(p)}: агенты работали ${workTime(t.ms)}` }))
+  return { rows, usdCols, hourCols }
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'stukach', description: 'Панель «Помощники»: сессии этой группы, их помощники, роли, модели, действия' })
     void $.ui.open({ id: PANE, title: TITLE })
     $.clock.every(4000, () => $.ui.invalidate('ui.render'))
+    // Учёт статистики дочитывает расшифровки фоном; ведёт одна сессия, остальные читают готовое.
+    $.clock.every(5000, async () => {
+      try {
+        if (!(await settingsOf($)).stats) return
+        if (await ledgerTick($, home, me)) $.ui.invalidate('ui.render')
+      } catch { /* учёт — не повод ронять сессию */ }
+    })
     await ensureMe($).then(() => writeWaits($)).catch(() => {}) // сброс: прошлый модуль мог оставить ожидания
     return next(e)
   })
@@ -270,6 +351,74 @@ export const register: Register = on => {
   on('command.run', { command: 'stukach' }, async $ => {
     await $.ui.open({ id: PANE, title: TITLE })
     return { text: 'Панель «Помощники» открыта.' }
+  })
+
+  // Погода: запросы основной сессии к модели — от каждого считается жизнь кеша, срок — из ответа API.
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId !== undefined) return yield* next(e)
+    const at = await $.clock.now()
+    const result = yield* next(e)
+    const usage = result.usage
+    if (usage !== null) {
+      await update($, cacheRef, old => {
+        const ttl = (usage.ephemeral_1h_input_tokens ?? 0) > 0 ? '1h' : (usage.ephemeral_5m_input_tokens ?? 0) > 0 ? '5m' : (old?.ttl ?? '5m')
+        return { at, ttl }
+      })
+    }
+    return result
+  })
+
+  // Погода: на остывшем кеше первое Enter не отправляет, а называет цену; второе в течение 2 минут — отправляет.
+  // Только набранный человеком текст: команда или сообщение с картинкой проходят — в поле ввода их не вернуть целиком.
+  on('prompt.submit', async ($, e, next) => {
+    if (e.origin.kind !== 'composer' || e.command !== undefined || (e.attachments?.length ?? 0) > 0) return next(e)
+    if (!(await settingsOf($).catch(() => DEFAULTS)).weather) return next(e)
+    const now = await $.clock.now()
+    const mark = await read($, cacheRef)
+    const verdict = decide(mark, await read($, armedRef), now)
+    if (verdict === 'send') return next(e)
+    if (verdict === 'confirm') {
+      await update($, armedRef, () => null)
+      return next(e)
+    }
+    const { context } = await $.session.usage()
+    const count = context.tokens ?? 0
+    const minutes = mark === null ? 0 : Math.floor((now - mark.at) / 60_000)
+    const cost = mark === null ? undefined : rereadUsd(await $.session.model(), count, mark.ttl)
+    await update($, armedRef, () => ({ at: now, minutes, tokens: count, ...cost }))
+    await $.prompt.fill({ text: e.text })
+    return {
+      drop: cost === undefined
+        ? 'Кеш остыл: Enter ещё раз отправит сообщение.'
+        : `Кеш остыл: отправка ≈ ${usd(cost.cold)} по ценам API. Enter ещё раз отправит сообщение.`,
+    }
+  })
+
+  // Над полем ввода: предупреждение об остывшем кеше и кнопка, открывающая панель, пока она закрыта.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) return next(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const now = await $.clock.now()
+    const armed = (await settingsOf($).catch(() => DEFAULTS)).weather ? await read($, armedRef) : null
+    const isShown = (await $.ui.panes().catch(() => [])).some(p => p.id === PANE && p.isShown && p.isPlaced)
+    const isArmed = armed !== null && now - armed.at < CONFIRM_MS
+    if (!isArmed && isShown) return next(e)
+    return (
+      <Box flexDirection="column">
+        {isArmed && (
+          <Box borderStyle="round" borderColor="warning" paddingX={1}>
+            <Text color="warning">
+              {coldText(armed.minutes, armed.tokens, armed.cold === undefined || armed.warm === undefined ? undefined : { cold: armed.cold, warm: armed.warm })}
+            </Text>
+          </Box>
+        )}
+        {!isShown && (
+          <Button key="open-pane" plain dimColor onPress={() => void $.ui.open({ id: PANE, title: TITLE })}>
+            👥 Помощники
+          </Button>
+        )}
+      </Box>
+    )
   })
 
   // Ожидание разрешения видно только изнутри сессии: пишем его в файл, панель любой сессии читает.
@@ -292,23 +441,154 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
-    let views: SessionView[]
-    try {
-      views = await collect($)
-    } catch (err) {
-      return <Text color="error">Не прочитать сессии: {String(err)}</Text>
-    }
+    const els = $.ui.resolve(e)
+    const { Box, Text, Button, Input } = els
+    const Svg = e.surface === 'terminal' ? undefined : (els as Elements['desktop']).Svg // на терминале графиков нет — столбцы текстом
+    const s = await settingsOf($).catch(() => DEFAULTS)
     const now = await $.clock.now()
+    const usage = await $.session.usage().catch(() => undefined)
+    let views: SessionView[] = []
+    let readError = ''
+    if (s.helpers) {
+      try {
+        views = await collect($)
+      } catch (err) {
+        readError = String(err)
+      }
+    }
     const helpers = views.flatMap(v => [...v.own.live, ...v.waves.flatMap(w => w.live)])
     const count = (k: State['kind']) => [...views, ...helpers].filter(x => x.state.kind === k).length
+
+    // Статистика: неделя лимита (по сбросу недельного окна) и месяц подписки (с дня оплаты).
+    if (s.stats) await ledgerRefresh($, home).catch(() => {})
+    const { hours, progress } = ledgerView()
+    const p = await payDayOf($)
+    const resetsAt = Date.parse(usage?.rateLimits.find(l => l.kind === 'seven_day')?.resetsAt ?? '') || undefined
+    const week = limitWeeks(resetsAt, now, 1)[0]!
+    const month = payMonths(p.day, now, 1)[0]!
+    const w = sumHours(hours, week.from, week.to)
+    const m = sumHours(hours, month.from, month.to)
 
     if (e.props.placement === 'widget') {
       return (
         <Box flexDirection="column">
-          <Text>{views.length} сесс. · {helpers.length} помощн.</Text>
-          <Text color="success">работают: {count('working')}</Text>
+          {s.helpers && <Text>{views.length} сесс. · {helpers.length} помощн.</Text>}
+          {s.helpers && <Text color="success">работают: {count('working')}</Text>}
           {count('waiting') > 0 && <Text color="warning" bold>ждут разрешения: {count('waiting')}</Text>}
+          {s.stats && <Text dimColor>≈ {money(m.usd)} за месяц по ценам API</Text>}
+        </Box>
+      )
+    }
+
+    // Первая строка: погода этой сессии (как в моде context-weather) и шестерёнка настроек.
+    const mark = await read($, cacheRef)
+    const weatherParts = () => {
+      if (!usage) return [<Text dimColor>погода: —</Text>]
+      const { context, rateLimits, cost } = usage
+      const percent = context.percent ?? (context.tokens === undefined ? 0 : (context.tokens / context.window) * 100)
+      const sky = weather(percent)
+      const filled = Math.max(0, Math.min(BAR, Math.round((percent / 100) * BAR)))
+      const left = mark === null ? 0 : cacheLeftMs(mark, now)
+      return [
+        <Text color={sky.color} bold>{`${sky.icon} ${sky.name}`}</Text>,
+        <Box flexDirection="row">
+          {filled > 0 && <Text color={sky.color}>{'█'.repeat(filled)}</Text>}
+          {filled < BAR && <Text dimColor>{'░'.repeat(BAR - filled)}</Text>}
+        </Box>,
+        <Text>{context.tokens === undefined ? '—' : `${Math.round(percent)}% · ${tokens(context.tokens)}/${tokens(context.window)}`}</Text>,
+        ...[...rateLimits].sort((a, b) => rank(a.kind) - rank(b.kind)).map(l => (
+          <Text {...(l.percentUsed >= 80 ? { color: 'warning' as const } : { dimColor: true })}>{`${LIMIT_LABEL[l.kind] ?? l.kind} ${Math.round(l.percentUsed)}%`}</Text>
+        )),
+        cost !== undefined && <Text dimColor>{`$${cost.usd.toFixed(2)}`}</Text>,
+        mark !== null && (left > 0 ? <Text dimColor>{`кеш: ещё ${Math.ceil(left / 60_000)} мин`}</Text> : <Text color="error">кеш остыл</Text>),
+      ]
+    }
+    const isGear = await read($, gearRef)
+    const box = (isOn: boolean) => (isOn ? '☑' : '☐')
+    const topRow = (
+      <Box flexDirection="row" justifyContent="space-between">
+        <Box flexDirection="row" flexWrap="wrap" columnGap={1}>{s.weather ? weatherParts() : <Text dimColor>{TITLE}</Text>}</Box>
+        <Button key="gear" plain onPress={() => update($, gearRef, g => !g)}>⚙</Button>
+      </Box>
+    )
+    const gear = isGear && (
+      <Box flexDirection="column" borderStyle="round" paddingX={1} marginTop={1}>
+        <Text bold>Что показывать</Text>
+        <Button key="set-weather" plain onPress={() => saveSettings($, { weather: !s.weather })}>{box(s.weather)} Погода контекста</Button>
+        <Button key="set-stats" plain onPress={() => saveSettings($, { stats: !s.stats })}>{box(s.stats)} Статистика</Button>
+        <Button key="set-helpers" plain onPress={() => saveSettings($, { helpers: !s.helpers })}>{box(s.helpers)} Помощники</Button>
+        <Input
+          key="set-price"
+          label="Подписка, $ в месяц: "
+          value={String(s.price)}
+          submitLabel="сохранить"
+          onSubmit={v => {
+            const n = Number(v.trim().replace(',', '.'))
+            if (Number.isFinite(n) && n >= 0) void saveSettings($, { price: n })
+          }}
+        />
+        <Button key="gear-done" onPress={() => update($, gearRef, () => false)}>Готово</Button>
+      </Box>
+    )
+
+    const isExpanded = await read($, expandedRef)
+    const weekName = resetsAt ? `Неделя лимита (${dateShort(week.from, true)} – ${dateShort(week.to, true)})` : 'Последние 7 дней'
+    const monthName = `${p.isSub ? 'Месяц подписки' : 'Месяц'} (${dateShort(month.from)} – ${dateShort(month.to - 1)})`
+    const section = (title: string, periods: Period[], range: (q: Period) => string) => {
+      const c = columnsOf(hours, periods, q => dateShort(q.from), now)
+      const hoursText = (h: number) => workTime(h * HOUR)
+      return (
+        <Box flexDirection="column" marginTop={1}>
+          <Text bold>{title}</Text>
+          {c.rows.length === 0 && <Text dimColor>данных ещё нет</Text>}
+          {c.rows.length > 0 && Svg && [
+            <Svg source={columnsSvg('Стоимость по ценам API', c.usdCols, money)} alt={`Стоимость по ценам API: ${c.usdCols.map(x => `${x.label} ${money(x.value)}`).join(', ')}`} isInteractive />,
+            <Svg source={columnsSvg('Работа агентов', c.hourCols, hoursText)} alt={`Работа агентов: ${c.hourCols.map(x => `${x.label} ${hoursText(x.value)}`).join(', ')}`} isInteractive />,
+          ]}
+          {c.rows.length > 0 && !Svg && [
+            <Text dimColor>Стоимость по ценам API</Text>,
+            ...columnsText(c.usdCols, money).map(line => <Text wrap="truncate-end">{line}</Text>),
+            <Text dimColor>Работа агентов</Text>,
+            ...columnsText(c.hourCols, hoursText).map(line => <Text wrap="truncate-end">{line}</Text>),
+          ]}
+          {c.rows.map(({ p: q, t }) => <Text dimColor wrap="truncate-end">{range(q)}: {money(t.usd)} · {workTime(t.ms)}</Text>)}
+        </Box>
+      )
+    }
+    const start = firstHour(hours)
+    const stats = s.stats && (
+      <Box flexDirection="column" marginTop={1}>
+        <Button key="stats" plain onPress={() => update($, expandedRef, x => !x)}>
+          <Text bold>📊 Статистика {isExpanded ? '▾ свернуть' : '▸ история и графики'}</Text>
+        </Button>
+        {progress !== undefined && <Text dimColor>считаю историю расшифровок: {Math.round(progress * 100)}% — числа пока неполные</Text>}
+        <Text wrap="wrap">{weekName}: ≈ {money(w.usd)} по ценам API · агенты работали {workTime(w.ms)}{workDays(w.ms)}</Text>
+        <Text wrap="wrap">{monthName}: ≈ {money(m.usd)} по ценам API{timesPrice(m.usd, s.price)} · агенты работали {workTime(m.ms)}{workDays(m.ms)}</Text>
+        {m.unpriced > 0 && <Text dimColor>ответов модели без цены за месяц: {m.unpriced}</Text>}
+        {isExpanded && [
+          section('По месяцам подписки', payMonths(p.day, now, 6), q => `${dateShort(q.from)} – ${dateShort(q.to - 1)}`),
+          section('По неделям лимита', limitWeeks(resetsAt, now, 12), q => `${dateShort(q.from, true)} – ${dateShort(q.to, true)}`),
+          Number.isFinite(start) && <Text dimColor wrap="wrap">Учёт с {dateShort(start)}: расшифровки старше 90 дней Claude Code удаляет, дальше мод хранит итоги сам. Цены — справочник Claude API на 3 ноября 2026.</Text>,
+        ]}
+      </Box>
+    )
+
+    if (!s.helpers) {
+      return (
+        <Box flexDirection="column">
+          {topRow}
+          {gear}
+          {stats}
+        </Box>
+      )
+    }
+    if (readError) {
+      return (
+        <Box flexDirection="column">
+          {topRow}
+          {gear}
+          {stats}
+          <Text color="error">Не прочитать сессии: {readError}</Text>
         </Box>
       )
     }
@@ -330,7 +610,10 @@ export const register: Register = on => {
     ]
     return (
       <Box flexDirection="column">
-        <Text dimColor wrap="wrap">🧐 скептик · 🔍 поиск · 🛠 исполнитель · ✅ проверка · 🗺 план · ❔ роль не ясна</Text>
+        {topRow}
+        {gear}
+        {stats}
+        <Text dimColor wrap="wrap">{s.weather || s.stats ? '\n' : ''}🧐 скептик · 🔍 поиск · 🛠 исполнитель · ✅ проверка · 🗺 план · ❔ роль не ясна</Text>
         {count('waiting') > 0 && <Text color="warning" bold>⏳ Ждут вашего разрешения: {count('waiting')}</Text>}
         {views.map(v => (
           <Box flexDirection="column" marginTop={1}>
