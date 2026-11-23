@@ -156,12 +156,15 @@ export async function ledgerTick($: $, home: string, me: string): Promise<boolea
     // («остаток меньше куска») считало разобранным любой непрочитанный файл меньше 4 МБ — живое окно 23.11 показало
     // «учёт готов» на 483 файлах из 4823. Флаг пересчитывается каждый тик: ошибочная отметка в файле снимется сама.
     const isDone = historyDone(queue, l.files, stalled)
-    if (l.isComplete !== isDone) {
+    const isFlipped = l.isComplete !== isDone
+    if (isFlipped) {
       l.isComplete = isDone
       if (!isDone && total === 0) total = left
       isDirty = true
     }
-    if (isDirty && (isDone || now - lastSave > SAVE_MS)) {
+    // Файл пишется не чаще раза в SAVE_MS: другие окна видят итоги с отставанием до 30 с, ведущее — сразу (из памяти).
+    // Смена «считаю историю ↔ готово» пишется немедленно. Прежнее условие («готово» — пиши) переписывало ~1 МБ каждые 5 с.
+    if (isDirty && (isFlipped || now - lastSave > SAVE_MS)) {
       l.progress = l.isComplete ? undefined : ledgerView().progress
       // последние ответы нужны только дописываемому файлу; у затихшего их не хранить — файл учёта в 2,5 раза меньше
       // ponytail: 4823 расшифровки — ~0,9 МБ при пределе записи 4 МБ; вырастет — хранить пути короче (номер проекта)
