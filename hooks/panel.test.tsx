@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { consume } from './ledger'
+import { consume, historyDone } from './ledger'
 import { sumHours, utf8Bytes } from './stats'
 import type { Hours } from './stats'
 
@@ -83,6 +83,19 @@ test('учёт: кусок за куском — только целые стр�
   // полный кусок без перевода строки (картинка длиннее 4 МБ) пропускается целиком
   const big = { o: 0, lastTs: 0, isOpen: false, recent: [] as string[] }
   expect(consume(big, 'x'.repeat(10), 4 * 1024 * 1024, {})).toBe(4 * 1024 * 1024)
+})
+
+test('учёт: «история разобрана» — по непрочитанному в сумме, без дописываемых сейчас файлов', async () => {
+  const MB = 1024 * 1024
+  // живое окно 23.11: десятки непрочитанных расшифровок помощников меньше 4 МБ — прежнее условие считало их разобранными
+  const queue: [string, number][] = Array.from({ length: 10 }, (_, i) => [`p/s/subagents/agent-${i}.jsonl`, 3 * MB])
+  expect(historyDone(queue, {}, new Set())).toBe(false)
+  // прочитаны все, кроме одного — 3 МБ: это уже не история
+  const files = Object.fromEntries(queue.slice(1).map(([k, size]) => [k, { o: size }]))
+  expect(historyDone(queue, files, new Set())).toBe(true)
+  // большой файл с недописанной последней строкой — пишется сейчас, историю не держит
+  expect(historyDone([['p/big.jsonl', 40 * MB]], { 'p/big.jsonl': { o: 10 * MB } }, new Set(['p/big.jsonl']))).toBe(true)
+  expect(historyDone([['p/big.jsonl', 40 * MB]], { 'p/big.jsonl': { o: 10 * MB } }, new Set())).toBe(false)
 })
 
 const home = (extra: Record<string, string> = {}): F => new Map(Object.entries({

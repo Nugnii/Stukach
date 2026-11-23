@@ -19,6 +19,7 @@ const LOCK_MS = 30_000
 const SAVE_MS = 30_000
 const WALK_MS = 10 * 60_000
 const HOT_MS = 2 * 3600_000
+const BACKLOG_OK = 16 * 1024 * 1024 // столько непрочитанного — уже не «история», а то, что пишется сейчас
 const TICK_MS = 600 // ponytail: чтение за тик (тик раз в 5 с) — бережём слабый Mac; первый проход по 13 ГБ — около 10 минут фоном
 
 let ledger: Ledger | null = null
@@ -60,6 +61,12 @@ export function consume(m: Mark, text: string, length: number, hours: Hours): nu
   const step = utf8Bytes(whole)
   m.o += step
   return step
+}
+
+/** История разобрана: непрочитанного меньше BACKLOG_OK, не считая файлов, которые сейчас дописываются (stalled). */
+export function historyDone(queue: [string, number][], files: Record<string, { o: number }>, stalled: Set<string>): boolean {
+  const backlog = queue.reduce((n, [k, size]) => n + (stalled.has(k) ? 0 : Math.max(0, size - (files[k]?.o ?? 0))), 0)
+  return backlog < BACKLOG_OK
 }
 
 async function load($: $, path: string) {
@@ -132,6 +139,7 @@ export async function ledgerTick($: $, home: string, me: string): Promise<boolea
     left = queue.reduce((n, [k, size]) => n + size - (l.files[k]?.o ?? 0), 0)
     if (!l.isComplete && total === 0) total = left
 
+    const stalled = new Set<string>() // хвост без перевода строки: файл сейчас дописывается
     for (const [k, size] of queue) {
       if ((await $.clock.now()) - now > TICK_MS) break
       const m = (l.files[k] ??= { o: 0, lastTs: 0, isOpen: false, recent: [] })
@@ -139,13 +147,20 @@ export async function ledgerTick($: $, home: string, me: string): Promise<boolea
       while (m.o < size && (await $.clock.now()) - now <= TICK_MS) {
         const length = Math.min(CHUNK, size - m.o)
         const step = consume(m, await $.fs.read(`${root}/${k}`, { offset: m.o, length }).catch(() => ''), length, l.hours)
-        if (step === 0) break // последняя строка ещё пишется
+        if (step === 0) { stalled.add(k); break }
         left -= step
         isDirty = true
       }
     }
-    const isDone = queue.every(([k, size]) => (l.files[k]?.o ?? 0) >= size || size - (l.files[k]?.o ?? 0) < CHUNK)
-    if (isDone && !l.isComplete && isFull === false) { l.isComplete = true; isDirty = true }
+    // История разобрана, когда непрочитанного почти нет: дописываемые сейчас расшифровки — не история. Прежнее условие
+    // («остаток меньше куска») считало разобранным любой непрочитанный файл меньше 4 МБ — живое окно 23.11 показало
+    // «учёт готов» на 483 файлах из 4823. Флаг пересчитывается каждый тик: ошибочная отметка в файле снимется сама.
+    const isDone = historyDone(queue, l.files, stalled)
+    if (l.isComplete !== isDone) {
+      l.isComplete = isDone
+      if (!isDone && total === 0) total = left
+      isDirty = true
+    }
     if (isDirty && (isDone || now - lastSave > SAVE_MS)) {
       l.progress = l.isComplete ? undefined : ledgerView().progress
       // последние ответы нужны только дописываемому файлу; у затихшего их не хранить — файл учёта в 2,5 раза меньше
