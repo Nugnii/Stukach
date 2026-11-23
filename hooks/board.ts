@@ -74,7 +74,7 @@ type Line = {
   isMeta?: boolean
   message?: { model?: string; stop_reason?: string; content?: unknown }
 }
-type Block = { type?: string; id?: string; tool_use_id?: string; name?: string; input?: unknown }
+type Block = { type?: string; id?: string; tool_use_id?: string; name?: string; input?: unknown; is_error?: boolean; content?: unknown }
 
 /** Хвост расшифровки (JSON по строке): модель, последнее действие, закончен ли ход. */
 export function parseTail(text: string, isCut: boolean): Tail {
@@ -126,6 +126,17 @@ export function parseHead(text: string): { parent?: string; startedAt: number; p
   return { parent, startedAt, prompt }
 }
 
+/** Журнал волны: какие помощники кончились — с результатом (result) или с ошибкой (failed: лимит, сбой API). */
+export function finishedIn(journal: string): Set<string> {
+  const done = new Set<string>()
+  for (const raw of journal.split('\n')) {
+    let d: { type?: string; agentId?: string }
+    try { d = JSON.parse(raw) } catch { continue }
+    if ((d.type === 'result' || d.type === 'failed') && d.agentId) done.add(d.agentId)
+  }
+  return done
+}
+
 export function ago(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000))
   if (s < 60) return `${s} с`
@@ -133,19 +144,58 @@ export function ago(ms: number): string {
   return `${Math.round(s / 3600)} ч`
 }
 
-export type Background = Map<string, { what: string; ts: number }>
+export type Background = Map<string, { what: string; ts: number; task?: string }>
+/** Память разбора между кусками файла: кончившиеся запуски (расшифровка бывает переписана заново, и запуск
+ *  повторяется после своего конца) и вызовы TaskStop, ждущие ответа. */
+export type BgMemo = { ended: Set<string>; stops: Map<string, string> }
 
-/** Фоновые команды: запуск — вызов Bash с run_in_background, конец — уведомление с номером вызова. Строки целые. */
-export function scanBackground(lines: string[], pending: Background): void {
+/** JSON файла, который может быть недописан: при ошибке — запасное значение, а не падение всей панели. */
+export function parseOr<T>(text: string, fallback: T): T {
+  try { return JSON.parse(text) as T } catch { return fallback }
+}
+
+/** Фоновые команды: запуск — вызов Bash с run_in_background в ответе модели. Конец — уведомление с номером вызова,
+ *  отказ (запуск отклонён и не начинался) или принятый TaskStop с номером задачи из ответа на запуск. Строки целые. */
+export function scanBackground(lines: string[], pending: Background, memo: BgMemo = { ended: new Set(), stops: new Map() }): void {
+  const end = (id: string) => { pending.delete(id); memo.ended.add(id) }
   for (const line of lines) {
     if (line.includes('<tool-use-id>')) {
-      for (const m of line.matchAll(/<tool-use-id>(toolu_[A-Za-z0-9]+)<\/tool-use-id>/g)) pending.delete(m[1] ?? '')
+      for (const m of line.matchAll(/<tool-use-id>(toolu_[A-Za-z0-9]+)<\/tool-use-id>/g)) end(m[1] ?? '')
     }
-    if (!/"run_in_background":\s*true/.test(line) || !line.includes('"name":"Bash"')) continue
-    const id = /"id":"(toolu_[A-Za-z0-9]+)"/.exec(line)?.[1]
-    const desc = /"description":"((?:[^"\\]|\\.)*)"/.exec(line)?.[1]
-    const ts = Date.parse(/"timestamp":"([^"]+)"/.exec(line)?.[1] ?? '') || 0
-    if (id) pending.set(id, { what: desc ? (JSON.parse(`"${desc}"`) as string) : 'команда', ts })
+    // Копия запроса к модели (api-request-blob) повторяет прошлые вызовы и не несёт времени: запуском она не бывает.
+    if (line.includes('"type":"api-request')) continue
+    const isStopAnswer = memo.stops.size > 0 && line.includes('"tool_result"')
+    if (!isStopAnswer && !line.includes('"run_in_background"') && !line.includes('"is_error":true') && !line.includes('running in background with ID') && !line.includes('"name":"TaskStop"')) continue
+    let d: Line
+    try { d = JSON.parse(line) } catch { continue }
+    const content = Array.isArray(d.message?.content) ? (d.message!.content as Block[]) : []
+    if (d.type === 'assistant') {
+      const ts = Date.parse(d.timestamp ?? '') || 0
+      for (const b of content) {
+        const i = (b?.input ?? {}) as { run_in_background?: unknown; description?: unknown }
+        if (b?.type === 'tool_use' && b.name === 'TaskStop' && b.id) {
+          const task = (b.input as { task_id?: unknown } | undefined)?.task_id
+          if (typeof task === 'string') memo.stops.set(b.id, task) // снимаем по принятому ответу: отказ стража команду не останавливает
+        }
+        if (b?.type !== 'tool_use' || b.name !== 'Bash' || i.run_in_background !== true || !b.id || memo.ended.has(b.id)) continue
+        pending.set(b.id, { what: typeof i.description === 'string' && i.description ? i.description : 'команда', ts })
+      }
+    } else if (d.type === 'user') {
+      for (const b of content) {
+        if (b?.type !== 'tool_result' || !b.tool_use_id) continue
+        const stopped = memo.stops.get(b.tool_use_id)
+        if (stopped !== undefined) {
+          memo.stops.delete(b.tool_use_id)
+          if (!b.is_error) for (const [id, p] of pending) if (p.task === stopped) end(id)
+          continue
+        }
+        const p = pending.get(b.tool_use_id)
+        if (!p) continue
+        if (b.is_error) { end(b.tool_use_id); continue }
+        const text = typeof b.content === 'string' ? b.content : JSON.stringify(b.content ?? '')
+        p.task = /running in background with ID: (\w+)/.exec(text)?.[1]
+      }
+    }
   }
 }
 
@@ -155,7 +205,7 @@ const SILENT_MS = 30 * 60 * 1000
 /** Состояние сессии или помощника. Ожидание разрешения — только из записи мода той сессии. */
 export function stateOf(o: { tail: Tail; now: number; isHelper: boolean; isFinished?: boolean; wait?: Wait; hasWaitFile: boolean; background?: { what: string; ts: number }[] }): State {
   const { tail, now, wait } = o
-  const bg = (o.background ?? []).map(b => `${b.what} (${ago(now - b.ts)})`).join(', ')
+  const bg = (o.background ?? []).map(b => `${b.what} (${b.ts ? ago(now - b.ts) : 'время запуска неизвестно'})`).join(', ')
   if (wait) return { kind: 'waiting', text: `ждёт разрешения: ${wait.tool} ${wait.what} · ${ago(now - wait.since)}` }
   if (o.isFinished || (o.isHelper && tail.isTurnEnded)) return { kind: 'done', text: 'закончил' }
   if (tail.isTurnEnded) return bg ? { kind: 'working', text: `ход закончен, фоном идёт: ${bg}` } : { kind: 'idle', text: 'ход закончен' }

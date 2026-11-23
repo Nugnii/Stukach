@@ -1,25 +1,30 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-import { ago, describeCall, familyOf, parseHead, parseTail, roleOf, scanBackground, shortModel, stateOf } from './board'
-import type { Background, Role, State, Tail, Wait } from './board'
+import { ago, describeCall, familyOf, finishedIn, parseHead, parseOr, parseTail, roleOf, scanBackground, shortModel, stateOf } from './board'
+import type { Background, BgMemo, Role, State, Tail, Wait } from './board'
 
 const PANE = 'stukach'
 const TITLE = 'Помощники'
 const DAY = 24 * 3600 * 1000
 const TAIL_BYTES = 128 * 1024
 const HEAD_BYTES = 8 * 1024
+// ponytail: строк работающих помощников в группе (сессия, волна); в волне их бывают десятки — сверх предела только число
 const MAX_HELPERS = 8
 
 type $ = EngineInterface
 type Helper = { id: string; role: Role; model?: string; description: string; state: State; tail: Tail }
-type SessionView = { id: string; link?: string; depth: number; title: string; model?: string; state: State; tail: Tail; helpers: Helper[]; isMe: boolean }
+type Group = { live: Helper[]; done: number; total: number } // live — все незаконченные, ждущие разрешения первыми
+type Wave = Group & { name: string }
+type SessionView = { id: string; link?: string; depth: number; title: string; model?: string; state: State; tail: Tail; own: Group; waves: Wave[]; isMe: boolean }
+type Entry = Awaited<ReturnType<$['fs']['list']>>[number]
 
 // Кеш на время жизни модуля: начало файла не меняется, хвост перечитывается при смене размера.
 const heads = new Map<string, ReturnType<typeof parseHead>>()
 const tails = new Map<string, { size: number; tail: Tail }>()
-const bgs = new Map<string, { offset: number; carry: string; pending: Background }>()
-const metas = new Map<string, { size: number; mtime: number; meta: Meta }>()
-type Meta = { agentType?: string; description?: string; model?: string; pickedEffortModel?: string; finished?: boolean }
+const bgs = new Map<string, { offset: number; carry: string; pending: Background; memo: BgMemo }>()
+const parsed = new Map<string, { size: number; mtime: number; value: unknown }>()
+type Meta = { agentType?: string; description?: string; model?: string; finished?: boolean }
+type Run = { status?: string; workflowName?: string } // workflows/<wf_id>.json: пишется, когда волна кончилась
 
 const appIds = new Map<string, string>() // запись приложения local_….json -> номер сессии в файлах
 const waiting = new Map<string, Wait>() // ожидания разрешения в ЭТОЙ сессии, по агенту
@@ -48,7 +53,7 @@ async function tailOf($: $, path: string, size: number) {
 async function backgroundOf($: $, path: string, size: number) {
   let st = bgs.get(path)
   if (!st || size < st.offset) {
-    st = { offset: 0, carry: '', pending: new Map() }
+    st = { offset: 0, carry: '', pending: new Map(), memo: { ended: new Set(), stops: new Map() } }
     bgs.set(path, st)
   }
   while (st.offset < size) {
@@ -56,17 +61,78 @@ async function backgroundOf($: $, path: string, size: number) {
     const lines = (st.carry + (await $.fs.read(path, { offset: st.offset, length }))).split('\n')
     st.offset += length
     st.carry = lines.pop() ?? ''
-    scanBackground(lines, st.pending)
+    scanBackground(lines, st.pending, st.memo)
   }
   return [...st.pending.values()]
 }
 
-async function metaOf($: $, path: string, size: number, mtime: number) {
-  const hit = metas.get(path)
-  if (hit && hit.size === size && hit.mtime === mtime) return hit.meta
-  const meta = JSON.parse(await $.fs.read(path)) as Meta
-  metas.set(path, { size, mtime, meta })
-  return meta
+// Малый файл целиком (meta помощника, журнал волны), разобранный заново только при смене размера или времени.
+async function parsedOf<T>($: $, path: string, e: Entry, parse: (text: string) => T): Promise<T> {
+  const hit = parsed.get(path)
+  if (hit && hit.size === e.size && hit.mtime === e.mtimeMs) return hit.value as T
+  const value = parse(await $.fs.read(path))
+  parsed.set(path, { size: e.size, mtime: e.mtimeMs, value })
+  return value
+}
+
+type Ctx = { now: number; waits: Record<string, Wait>; hasWaitFile: boolean }
+
+const isLog = (x: Entry) => /^agent-.*\.jsonl$/.test(x.name)
+
+// Помощники одной папки. Законченный — только в числе: его строка владельцу не нужна.
+// ponytail: хвост читается у каждого незаконченного, не у восьми свежих — иначе законченный по хвосту и ждущий
+// разрешения прятались за пределом; потолок — десятки помощников, одновременно пишущих расшифровки
+async function helpersIn($: $, folder: string, entries: Entry[], finished: Set<string>, c: Ctx): Promise<Group> {
+  const logs = entries.filter(isLog).sort((a, b) => b.mtimeMs - a.mtimeMs)
+  const g: Group = { live: [], done: 0, total: logs.length }
+  for (const log of logs) {
+    const agentId = log.name.slice(6, -6)
+    const metaEntry = entries.find(x => x.name === `agent-${agentId}.meta.json`)
+    const meta: Meta = metaEntry ? await parsedOf($, `${folder}/${metaEntry.name}`, metaEntry, t => parseOr<Meta>(t, {})) : {}
+    const wait = c.waits[agentId]
+    if (!wait && (meta.finished || finished.has(agentId))) { g.done++; continue }
+    const path = `${folder}/${log.name}`
+    const t = await tailOf($, path, log.size)
+    const state = stateOf({ tail: t, now: c.now, isHelper: true, isFinished: meta.finished, wait, hasWaitFile: c.hasWaitFile })
+    if (state.kind === 'done') { g.done++; continue }
+    const description = meta.description ?? ''
+    g.live.push({
+      id: agentId,
+      role: roleOf(description, meta.agentType ?? '', (await head($, path)).prompt),
+      // модель — из ответов помощника; до первого ответа — заказанная (pickedEffortModel с ответами расходится)
+      model: shortModel(t.model ?? meta.model),
+      description: description || (meta.agentType ?? agentId),
+      state,
+      tail: t,
+    })
+  }
+  g.live.sort((a, b) => Number(b.state.kind === 'waiting') - Number(a.state.kind === 'waiting')) // порядок по времени сохраняется
+  return g
+}
+
+// Волны (Workflow): помощники в subagents/workflows/<волна>/. Кончилась волна — есть workflows/<волна>.json
+// (completed, killed, failed); кончился помощник — запись result или failed в журнале волны.
+async function wavesOf($: $, sessionDir: string, c: Ctx): Promise<Wave[]> {
+  const root = `${sessionDir}/subagents/workflows`
+  const runs = await listOr($, `${sessionDir}/workflows`)
+  const scripts = await listOr($, `${sessionDir}/workflows/scripts`)
+  const waves: Wave[] = []
+  for (const w of (await listOr($, root)).filter(x => x.kind === 'dir')) {
+    const entries = await listOr($, `${root}/${w.name}`)
+    const runEntry = runs.find(x => x.name === `${w.name}.json`)
+    const run = runEntry ? await parsedOf($, `${sessionDir}/workflows/${runEntry.name}`, runEntry, t => parseOr<Run>(t, {})) : undefined
+    const script = scripts.find(x => x.name.endsWith(`-${w.name}.js`))
+    const name = run?.workflowName ?? (script ? script.name.slice(0, -(w.name.length + 4)) : w.name)
+    if (run?.status && run.status !== 'running') {
+      const n = entries.filter(isLog).length
+      waves.push({ name, live: [], done: n, total: n })
+      continue
+    }
+    const journal = entries.find(x => x.name === 'journal.jsonl')
+    const finished = journal ? await parsedOf($, `${root}/${w.name}/journal.jsonl`, journal, finishedIn) : new Set<string>()
+    waves.push({ name, ...(await helpersIn($, `${root}/${w.name}`, entries, finished, c)) })
+  }
+  return waves
 }
 
 const listOr = ($: $, path: string) => $.fs.list(path).catch(() => [])
@@ -148,35 +214,19 @@ async function collect($: $): Promise<SessionView[]> {
     const own = await listOr($, `${dir}/${id}`)
     const titleFile = own.find(x => x.name === 'custom-title.json')
     const title = titleFile
-      ? ((JSON.parse(await $.fs.read(`${dir}/${id}/custom-title.json`)) as { customTitle?: string }).customTitle ?? id.slice(0, 8))
+      ? (parseOr<{ customTitle?: string }>(await $.fs.read(`${dir}/${id}/custom-title.json`).catch(() => ''), {}).customTitle ?? id.slice(0, 8))
       : id.slice(0, 8)
     const hasWaitFile = waitNames.has(`${id}.json`)
     const waits: Record<string, Wait> = hasWaitFile
-      ? JSON.parse(await $.fs.read(`${waitsDir}/${id}.json`).catch(() => '{}'))
+      ? parseOr<Record<string, Wait>>(await $.fs.read(`${waitsDir}/${id}.json`).catch(() => '{}'), {})
       : {}
     const tail = await tailOf($, `${dir}/${file.name}`, file.size)
 
-    const sub = await listOr($, `${dir}/${id}/subagents`)
-    const logs = sub.filter(x => /^agent-.*\.jsonl$/.test(x.name)).sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, MAX_HELPERS)
-    const helpers: Helper[] = []
-    for (const log of logs) {
-      const agentId = log.name.slice(6, -6)
-      const metaEntry = sub.find(x => x.name === `agent-${agentId}.meta.json`)
-      const meta = metaEntry ? await metaOf($, `${dir}/${id}/subagents/${metaEntry.name}`, metaEntry.size, metaEntry.mtimeMs) : {}
-      const path = `${dir}/${id}/subagents/${log.name}`
-      const t = await tailOf($, path, log.size)
-      const description = meta.description ?? ''
-      helpers.push({
-        id: agentId,
-        role: roleOf(description, meta.agentType ?? '', (await head($, path)).prompt),
-        model: shortModel(t.model ?? meta.pickedEffortModel ?? meta.model),
-        description: description || (meta.agentType ?? agentId),
-        state: stateOf({ tail: t, now, isHelper: true, isFinished: meta.finished, wait: waits[agentId], hasWaitFile }),
-        tail: t,
-      })
-    }
+    const ctx: Ctx = { now, waits, hasWaitFile }
+    const direct = await helpersIn($, `${dir}/${id}/subagents`, await listOr($, `${dir}/${id}/subagents`), new Set(), ctx)
+    const waves = await wavesOf($, `${dir}/${id}`, ctx)
     views.push({
-      id, depth, title, tail, helpers, isMe: id === me, link: linkOf(id),
+      id, depth, title, tail, own: direct, waves, isMe: id === me, link: linkOf(id),
       model: shortModel(tail.model),
       state: stateOf({ tail, now, isHelper: false, wait: waits.main, hasWaitFile, background: await backgroundOf($, `${dir}/${file.name}`, file.size) }),
     })
@@ -187,6 +237,8 @@ async function collect($: $): Promise<SessionView[]> {
 const DOT: Record<State['kind'], string> = { working: '●', waiting: '⏳', done: '✓', idle: '○', silent: '·' }
 // работает — фирменный цвет, закончил — зелёный, ждёт разрешения — жёлтый
 const COLOR: Partial<Record<State['kind'], 'claude' | 'success' | 'warning' | 'subtle'>> = { working: 'claude', done: 'success', waiting: 'warning', silent: 'subtle' }
+
+const doneOf = (v: SessionView) => v.own.done + v.waves.reduce((n, w) => n + w.done, 0)
 
 function actionLine(t: Tail, now: number): string {
   const a = t.action
@@ -236,7 +288,7 @@ export const register: Register = on => {
       return <Text color="error">Не прочитать сессии: {String(err)}</Text>
     }
     const now = await $.clock.now()
-    const helpers = views.flatMap(v => v.helpers)
+    const helpers = views.flatMap(v => [...v.own.live, ...v.waves.flatMap(w => w.live)])
     const count = (k: State['kind']) => [...views, ...helpers].filter(x => x.state.kind === k).length
 
     if (e.props.placement === 'widget') {
@@ -250,6 +302,20 @@ export const register: Register = on => {
     }
 
     const pad = (depth: number) => '  '.repeat(depth)
+    const rows = (hp: Helper, depth: number) => (
+      <Box flexDirection="column">
+        <Text color={COLOR[hp.state.kind]} bold={hp.state.kind === 'waiting'} wrap="truncate-end">
+          {pad(depth)} {hp.role.icon} {hp.role.name} · {hp.model ?? 'модель ?'} · {DOT[hp.state.kind]} {hp.state.text}
+        </Text>
+        <Text dimColor wrap="truncate-end">{pad(depth)}    {hp.description}</Text>
+        <Text dimColor wrap="truncate-end">{pad(depth)}    {actionLine(hp.tail, now)}</Text>
+      </Box>
+    )
+    // первые MAX_HELPERS строкой, остальные числом
+    const group = (g: Group, depth: number) => [
+      ...g.live.slice(0, MAX_HELPERS).map(hp => rows(hp, depth)),
+      g.live.length > MAX_HELPERS && <Text dimColor>{pad(depth)}    …и ещё работают: {g.live.length - MAX_HELPERS}</Text>,
+    ]
     return (
       <Box flexDirection="column">
         <Text dimColor wrap="wrap">🧐 скептик · 🔍 поиск · 🛠 исполнитель · ✅ проверка · 🗺 план · ❔ роль не ясна</Text>
@@ -265,16 +331,15 @@ export const register: Register = on => {
               {pad(v.depth)}   {v.model ?? 'модель ?'} · {v.state.text}
             </Text>
             <Text dimColor wrap="truncate-end">{pad(v.depth)}   {actionLine(v.tail, now)}</Text>
-            {v.helpers.length === 0 && <Text dimColor>{pad(v.depth)}   помощников нет</Text>}
-            {v.helpers.map(hp => (
+            {v.waves.filter(w => w.live.length > 0).map(w => (
               <Box flexDirection="column">
-                <Text color={COLOR[hp.state.kind]} bold={hp.state.kind === 'waiting'} wrap="truncate-end">
-                  {pad(v.depth + 1)} {hp.role.icon} {hp.role.name} · {hp.model ?? 'модель ?'} · {DOT[hp.state.kind]} {hp.state.text}
-                </Text>
-                <Text dimColor wrap="truncate-end">{pad(v.depth + 1)}    {hp.description}</Text>
-                {hp.state.kind !== 'done' && <Text dimColor wrap="truncate-end">{pad(v.depth + 1)}    {actionLine(hp.tail, now)}</Text>}
+                <Text bold wrap="truncate-end">{pad(v.depth + 1)} 🌊 волна «{w.name}» · идут {w.live.length} из {w.total}</Text>
+                {group(w, v.depth + 2)}
               </Box>
             ))}
+            {group(v.own, v.depth + 1)}
+            {doneOf(v) > 0 && <Text color="success" dimColor>{pad(v.depth + 1)} ✓ закончили: {doneOf(v)}</Text>}
+            {v.own.total + v.waves.reduce((n, w) => n + w.total, 0) === 0 && <Text dimColor>{pad(v.depth)}   помощников нет</Text>}
           </Box>
         ))}
       </Box>

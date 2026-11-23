@@ -66,6 +66,66 @@ test('фон: ход закончен, а фоновая команда без �
   expect(state).toEqual({ kind: 'working', text: 'ход закончен, фоном идёт: Повтор подсказки (5 мин)' })
 })
 
+test('фон: копия запроса к модели и отклонённый запуск — не фоновые команды', () => {
+  // Форма живой расшифровки 4b7053d6: запуск, отказ стража, затем api-request-blob без времени с копией вызова.
+  const call = { type: 'tool_use', id: 'toolu_R1', name: 'Bash', input: { command: 'run', description: 'Прогон после правки', run_in_background: true } }
+  const launch = line({ type: 'assistant', timestamp: at(0), message: { content: [call] } })
+  const refused = line({ type: 'user', timestamp: at(1), message: { content: [{ type: 'tool_result', content: 'PreToolUse:Bash hook error: ОТКАЗ', is_error: true, tool_use_id: 'toolu_R1' }] } })
+  const edit = { type: 'tool_use', id: 'toolu_E2', name: 'Edit', input: { file_path: '/r/a.md' } }
+  const blob = line({ type: 'api-request-blob', hash: 'h', message: { content: [edit, call] } })
+  const pending: Background = new Map()
+  scanBackground([launch, refused, blob], pending)
+  expect([...pending.keys()]).toEqual([])
+})
+
+test('фон: команда, остановленная TaskStop, больше не идёт', () => {
+  // Форма живой расшифровки 8c2dee72: после TaskStop уведомления о конце нет.
+  const launch = line({ type: 'assistant', timestamp: at(0), message: { content: [{ type: 'tool_use', id: 'toolu_S1', name: 'Bash', input: { command: 'npm start', description: 'Сервер сайта', run_in_background: true } }] } })
+  const started = line({ type: 'user', timestamp: at(1), message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_S1', content: 'Command running in background with ID: b4rd7is4b. Output is being written to: /tmp/x' }] } })
+  const stop = line({ type: 'assistant', timestamp: at(60), message: { content: [{ type: 'tool_use', id: 'toolu_K2', name: 'TaskStop', input: { task_id: 'b4rd7is4b' } }] } })
+  const stopped = line({ type: 'user', timestamp: at(61), message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_K2', content: 'Successfully stopped task b4rd7is4b' }] } })
+  const pending: Background = new Map()
+  const memo = { ended: new Set<string>(), stops: new Map<string, string>() } // память между кусками файла
+  scanBackground([launch, started], pending, memo)
+  expect([...pending.keys()]).toEqual(['toolu_S1'])
+  scanBackground([stop], pending, memo)
+  expect([...pending.keys()]).toEqual(['toolu_S1']) // вызов ещё не принят
+  scanBackground([stopped], pending, memo)
+  expect([...pending.keys()]).toEqual([])
+  // TaskStop без номера задачи не снимает запуск, чей номер ещё не прочитан
+  const fresh = line({ type: 'assistant', timestamp: at(70), message: { content: [{ type: 'tool_use', id: 'toolu_F3', name: 'Bash', input: { command: 'run', description: 'Новый', run_in_background: true } }] } })
+  const blankStop = line({ type: 'assistant', timestamp: at(71), message: { content: [{ type: 'tool_use', id: 'toolu_K4', name: 'TaskStop', input: {} }] } })
+  const blankDone = line({ type: 'user', timestamp: at(72), message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_K4', content: 'ok' }] } })
+  scanBackground([fresh, blankStop, blankDone], pending, memo)
+  expect([...pending.keys()]).toEqual(['toolu_F3'])
+})
+
+// Атаки финального скептика (А4, А7): формы живых расшифровок.
+const skLaunch = line({ type: 'assistant', uuid: '0f03', timestamp: at(0), message: { content: [{ type: 'tool_use', id: 'toolu_D1', name: 'Bash', input: { command: 'run', description: 'Контрольный полный набор', run_in_background: true } }] } })
+const skStarted = line({ type: 'user', uuid: '3ac7', timestamp: at(1), message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_D1', content: 'Command running in background with ID: beznlnf3m. Output is being written to: /tmp/x' }] } })
+const skNotif = line({ type: 'user', timestamp: at(60), message: { content: '<task-notification>\n<task-id>beznlnf3m</task-id>\n<tool-use-id>toolu_D1</tool-use-id>\n<status>completed</status>\n</task-notification>' } })
+
+test('фон (А4): запись запуска, переписанная после уведомления о конце, команду не воскрешает', () => {
+  // Форма живой расшифровки 983c43c4 (строки 1621/1673/3105): после уведомления история переписана в файл заново.
+  const pending: Background = new Map()
+  scanBackground([skLaunch, skStarted, skNotif, skLaunch, skStarted], pending)
+  expect([...pending.keys()]).toEqual([])
+})
+
+test('фон (А7): TaskStop, отклонённый стражем, команду не снимает', () => {
+  const stop = line({ type: 'assistant', timestamp: at(30), message: { content: [{ type: 'tool_use', id: 'toolu_K', name: 'TaskStop', input: { task_id: 'beznlnf3m' } }] } })
+  const refused = line({ type: 'user', timestamp: at(31), message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_K', is_error: true, content: 'PreToolUse:TaskStop hook error: ⛔ ОТКАЗ' }] } })
+  const pending: Background = new Map()
+  scanBackground([skLaunch, skStarted, stop, refused], pending)
+  expect([...pending.keys()]).toEqual(['toolu_D1'])
+})
+
+test('фон: незнакомое время запуска показано как незнакомое, а не 57 лет', () => {
+  const now = T0 + 5 * 60 * 1000
+  const state = stateOf({ tail: parseTail(said(20), false), now, isHelper: false, hasWaitFile: true, background: [{ what: 'Прогон', ts: 0 }] })
+  expect(state.text).toBe('ход закончен, фоном идёт: Прогон (время запуска неизвестно)')
+})
+
 test('семья: корень — верхний предок, дети по времени запуска', () => {
   const head = parseHead([line({ type: 'derived-from', sessions: [{ id: 'root', via: 'launch' }] }), line({ type: 'queue-operation', timestamp: at(1) })].join('\n'))
   expect(head).toMatchObject({ parent: 'root', startedAt: T0 + 1000 })
