@@ -183,23 +183,34 @@ async function clearWait($: $, agentId?: string) {
 async function collect($: $): Promise<SessionView[]> {
   await ensureMe($)
   const { transcriptPath } = await $.session.info()
-  const dir = transcriptPath.slice(0, transcriptPath.lastIndexOf('/'))
+  const here = transcriptPath.slice(0, transcriptPath.lastIndexOf('/'))
+  const root = here.slice(0, here.lastIndexOf('/'))
   const now = await $.clock.now()
-  const entries = await $.fs.list(dir)
-  const released = new Set(entries.filter(x => x.name.endsWith('.desktop-released.json')).map(x => x.name.split('.')[0]))
-  // ponytail: семья ищется среди сессий этого проекта за сутки; дочерняя в другом проекте не видна
-  const files = new Map(entries.filter(x => x.kind === 'file' && x.name.endsWith('.jsonl')).map(x => [x.name.slice(0, -6), x]))
+  // Семья ищется по всем проектам: оркестратор запускает сессии в других папках (замер 23.11: оркестратор
+  // в ClaudSoul, его сессии — в папках своих репозиториев). Папка каждой сессии — своя.
+  // ponytail: 53 папки читаются за сотые доли секунды; станет тяжело — читать только папки с новым mtime
+  const dirs = [here, ...(await listOr($, root)).filter(x => x.kind === 'dir').map(x => `${root}/${x.name}`).filter(d => d !== here)]
+  const files = new Map<string, { dir: string; entry: Entry }>()
+  const released = new Set<string>()
+  for (const d of dirs) {
+    for (const x of d === here ? await $.fs.list(d) : await listOr($, d)) {
+      const id = x.name.split('.')[0] ?? ''
+      if (x.name.endsWith('.desktop-released.json')) released.add(id)
+      else if (x.kind === 'file' && x.name.endsWith('.jsonl') && !files.has(id)) files.set(id, { dir: d, entry: x })
+    }
+  }
+  const pathOf = (id: string) => { const f = files.get(id)!; return `${f.dir}/${f.entry.name}` }
   const parents = new Map<string, string | undefined>()
   const started = new Map<string, number>()
-  for (const [id, x] of files) {
-    if (released.has(id) || (now - x.mtimeMs > DAY && id !== me)) continue
-    const h = await head($, `${dir}/${x.name}`)
+  for (const [id, { entry }] of files) {
+    if (released.has(id) || (now - entry.mtimeMs > DAY && id !== me)) continue
+    const h = await head($, pathOf(id))
     parents.set(id, h.parent)
     started.set(id, h.startedAt)
   }
   // предки старше суток: читаем их начало, чтобы найти корень
   for (let p = parents.get(me); p && !parents.has(p) && files.has(p); p = parents.get(p)) {
-    parents.set(p, (await head($, `${dir}/${p}.jsonl`)).parent)
+    parents.set(p, (await head($, pathOf(p))).parent)
   }
 
   const waitsDir = waitFile.slice(0, waitFile.lastIndexOf('/'))
@@ -209,8 +220,9 @@ async function collect($: $): Promise<SessionView[]> {
   await appLinks($, waitFile.slice(0, waitFile.indexOf('/.claude/')), family.map(x => x.id)).catch(() => {})
   const views: SessionView[] = []
   for (const { id, depth } of family) {
-    const file = files.get(id)
-    if (!file) continue
+    const f = files.get(id)
+    if (!f) continue
+    const { dir, entry: file } = f
     const own = await listOr($, `${dir}/${id}`)
     const titleFile = own.find(x => x.name === 'custom-title.json')
     const title = titleFile
