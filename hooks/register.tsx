@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, Register } from 'claude-code'
 
-import { ago, describeCall, familyOf, finishedIn, parseHead, parseOr, parseTail, roleOf, scanBackground, shortModel, stateOf } from './board'
+import { SILENT_MS, ago, describeCall, familyOf, finishedIn, parseHead, parseOr, parseTail, roleOf, scanBackground, shortModel, stateOf } from './board'
 import type { Background, BgMemo, Role, State, Tail, Wait } from './board'
 import { columnsSvg, columnsText } from './charts'
 import type { Column } from './charts'
@@ -28,7 +28,10 @@ type $ = EngineInterface
 type Helper = { id: string; role: Role; model?: string; description: string; state: State; tail: Tail }
 type Group = { live: Helper[]; done: number; total: number } // live — все незаконченные, ждущие разрешения первыми
 type Wave = Group & { name: string }
-type SessionView = { id: string; link?: string; depth: number; title: string; model?: string; state: State; tail: Tail; own: Group; waves: Wave[]; isMe: boolean }
+type SessionView = {
+  id: string; link?: string; depth: number; title: string; model?: string; state: State; tail: Tail; own: Group; waves: Wave[]; isMe: boolean
+  isOrchestrator: boolean; isParallel: boolean; project?: string // isParallel — из чужой семьи, project — папка сессии в приложении
+}
 type Entry = Awaited<ReturnType<$['fs']['list']>>[number]
 
 // Кеш на время жизни модуля: начало файла не меняется, хвост перечитывается при смене размера.
@@ -40,6 +43,7 @@ type Meta = { agentType?: string; description?: string; model?: string; finished
 type Run = { status?: string; workflowName?: string } // workflows/<wf_id>.json: пишется, когда волна кончилась
 
 const appIds = new Map<string, string>() // запись приложения local_….json -> номер сессии в файлах
+const appCwds = new Map<string, string>() // номер сессии в файлах -> её папка из записи приложения
 const waiting = new Map<string, Wait>() // ожидания разрешения в ЭТОЙ сессии, по агенту
 let me = ''
 let waitFile = ''
@@ -210,10 +214,19 @@ async function appLinks($: $, home: string, wanted: string[]) {
         if (!/^local_.*\.json$/.test(f.name) || appIds.has(f.name)) continue
         const head = await $.fs.read(`${root}/${account.name}/${org.name}/${f.name}`, { length: 1024 }).catch(() => '')
         const cli = /"cliSessionId":\s*"([^"]+)"/.exec(head)?.[1]
+        const cwd = /"cwd":\s*"([^"]+)"/.exec(head)?.[1]
         if (cli) appIds.set(f.name, cli)
+        if (cli && cwd) appCwds.set(cli, cwd)
       }
     }
   }
+}
+
+// Папка сессии коротко: последнее имя пути; рабочая папка, которую приложение завело само, — «без папки».
+function projectOf(cliId: string) {
+  const cwd = appCwds.get(cliId)
+  if (!cwd) return undefined
+  return cwd.includes('/scratch-workspaces/') ? 'без папки' : cwd.split('/').filter(Boolean).pop()
 }
 
 function linkOf(cliId: string) {
@@ -268,11 +281,19 @@ async function collect($: $): Promise<SessionView[]> {
   const waitNames = new Set((await listOr($, waitsDir)).map(x => x.name))
 
   const family = familyOf(me, parents, started)
-  await appLinks($, waitFile.slice(0, waitFile.indexOf('/.claude/')), family.map(x => x.id)).catch(() => {})
-  const views: SessionView[] = []
-  for (const { id, depth } of family) {
+  // Параллельные семьи — деревья без этой сессии: другие проекты, сессии, открытые вручную. Новые первыми.
+  const trees = [family]
+  const seen = new Set(family.map(x => x.id))
+  for (const id of [...parents.keys()].sort((a, b) => (started.get(b) ?? 0) - (started.get(a) ?? 0))) {
+    if (seen.has(id)) continue
+    const tree = familyOf(id, parents, started)
+    for (const x of tree) seen.add(x.id)
+    trees.push(tree)
+  }
+
+  const viewOf = async (id: string, depth: number, isOrchestrator: boolean, isParallel: boolean): Promise<SessionView | undefined> => {
     const f = files.get(id)
-    if (!f) continue
+    if (!f) return undefined
     const { dir, entry: file } = f
     const own = await listOr($, `${dir}/${id}`)
     const titleFile = own.find(x => x.name === 'custom-title.json')
@@ -288,11 +309,31 @@ async function collect($: $): Promise<SessionView[]> {
     const ctx: Ctx = { now, waits, hasWaitFile }
     const direct = await helpersIn($, `${dir}/${id}/subagents`, await listOr($, `${dir}/${id}/subagents`), new Set(), ctx)
     const waves = await wavesOf($, `${dir}/${id}`, ctx)
-    views.push({
-      id, depth, title, tail, own: direct, waves, isMe: id === me, link: linkOf(id),
+    return {
+      id, depth, title, tail, own: direct, waves, isMe: id === me, isOrchestrator, isParallel,
       model: shortModel(tail.model),
       state: stateOf({ tail, now, isHelper: false, wait: waits.main, hasWaitFile, background: await backgroundOf($, `${dir}/${file.name}`, file.size) }),
-    })
+    }
+  }
+  // живая — работает, ждёт разрешения, писала за последние 30 минут или у неё работает помощник
+  const isBusy = (s: State) => s.kind === 'working' || s.kind === 'waiting'
+  const isLive = (v: SessionView) => isBusy(v.state) || now - v.tail.lastTs < SILENT_MS || [v.own, ...v.waves].some(g => g.live.some(h => isBusy(h.state)))
+
+  // ponytail: разбирается каждая сессия суток на каждом тике (хвосты кешированы по размеру); станет тяжело —
+  // отсеивать чужие семьи по mtime расшифровок до разбора
+  const views: SessionView[] = []
+  for (const [k, tree] of trees.entries()) {
+    const part: SessionView[] = []
+    for (const { id, depth } of tree) {
+      const v = await viewOf(id, depth, depth === 0 && tree.length > 1, k > 0)
+      if (v) part.push(v)
+    }
+    if (k === 0 || part.some(isLive)) views.push(...part)
+  }
+  await appLinks($, waitFile.slice(0, waitFile.indexOf('/.claude/')), views.map(v => v.id)).catch(() => {})
+  for (const v of views) {
+    v.link = linkOf(v.id)
+    v.project = projectOf(v.id)
   }
   return views
 }
@@ -334,7 +375,7 @@ function columnsOf(hours: Hours, periods: Period[], label: (p: Period) => string
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'stukach', description: 'Панель «Помощники»: сессии этой группы, их помощники, роли, модели, действия' })
+    await $.command.register({ name: 'stukach', description: 'Панель «Помощники»: сессии этой группы и живые параллельные, их помощники, роли, модели, действия' })
     void $.ui.open({ id: PANE, title: TITLE })
     $.clock.every(4000, () => $.ui.invalidate('ui.render'))
     // Учёт статистики дочитывает расшифровки фоном; ведёт одна сессия, остальные читают готовое.
@@ -617,11 +658,12 @@ export const register: Register = on => {
         {stats}
         <Text dimColor wrap="wrap">{s.weather || s.stats ? '\n' : ''}🧐 скептик · 🔍 поиск · 🛠 исполнитель · ✅ проверка · 🗺 план · ❔ роль не ясна</Text>
         {count('waiting') > 0 && <Text color="warning" bold>⏳ Ждут вашего разрешения: {count('waiting')}</Text>}
-        {views.map(v => (
+        {views.map((v, k) => (
           <Box flexDirection="column" marginTop={1}>
+            {v.isParallel && !views[k - 1]?.isParallel && <Text bold dimColor>── Параллельно, другие сессии ──</Text>}
             <Button key={`open-${v.id}`} plain onPress={() => openSession($, v.link)}>
               <Text bold color={COLOR[v.state.kind]} wrap="truncate-end">
-                {pad(v.depth)}{DOT[v.state.kind]} {v.title}{v.isMe ? ' (эта сессия)' : ''}{v.depth === 0 && views.length > 1 ? ' (оркестратор)' : ''}
+                {pad(v.depth)}{DOT[v.state.kind]} {v.isParallel && v.project ? `${v.project} · ` : ''}{v.title}{v.isMe ? ' (эта сессия)' : ''}{v.isOrchestrator ? ' (оркестратор)' : ''}
               </Text>
             </Button>
             <Text dimColor={v.state.kind !== 'waiting'} color={COLOR[v.state.kind]} wrap="truncate-end">

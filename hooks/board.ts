@@ -200,7 +200,7 @@ export function scanBackground(lines: string[], pending: Background, memo: BgMem
 }
 
 const HANG_MS = 3 * 60 * 1000
-const SILENT_MS = 30 * 60 * 1000
+export const SILENT_MS = 30 * 60 * 1000
 
 /** Состояние сессии или помощника. Ожидание разрешения — только из записи мода той сессии. */
 export function stateOf(o: { tail: Tail; now: number; isHelper: boolean; isFinished?: boolean; wait?: Wait; hasWaitFile: boolean; background?: { what: string; ts: number }[] }): State {
