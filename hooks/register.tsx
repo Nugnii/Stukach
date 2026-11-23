@@ -8,7 +8,7 @@ import type { Column } from './charts'
 import { ledgerRefresh, ledgerTick, ledgerView } from './ledger'
 import { dateShort, limitWeeks, money, payMonths, sumHours, workTime } from './stats'
 import type { Hours, Period } from './stats'
-import { BAR, CONFIRM_MS, LIMIT_LABEL, cacheLeftMs, coldText, decide, rank, rereadUsd, tokens, usd, weather } from './weather'
+import { BAR, CONFIRM_MS, LIMIT_LABEL, cacheLeftMs, coldText, decide, rank, rereadUsd, tokens, usd, weather, weatherModEnabled } from './weather'
 import type { Armed, CacheMark } from './weather'
 
 const cacheRef = atom({ plugin: 'stukach', key: 'cache' } as const, null as CacheMark | null)
@@ -373,6 +373,8 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     if (e.origin.kind !== 'composer' || e.command !== undefined || (e.attachments?.length ?? 0) > 0) return next(e)
     if (!(await settingsOf($).catch(() => DEFAULTS)).weather) return next(e)
+    // включён и context-weather — Enter придерживает он, второй придержки не нужно
+    if (weatherModEnabled(await $.settings.read({ key: 'enabledPlugins' }).catch(() => undefined))) return next(e)
     const now = await $.clock.now()
     const mark = await read($, cacheRef)
     const verdict = decide(mark, await read($, armedRef), now)

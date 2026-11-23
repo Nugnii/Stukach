@@ -3,7 +3,7 @@ import { expect, test } from 'claude-code/testing'
 import { columnsSvg, columnsText } from './charts'
 import { dateShort, limitWeeks, money, payMonths, priceUsd, scanLines, sumHours, workTime } from './stats'
 import type { Hours } from './stats'
-import { coldText, decide, rereadUsd, tokens, weather } from './weather'
+import { coldText, decide, rereadUsd, tokens, weather, weatherModEnabled } from './weather'
 
 const j = (o: object) => JSON.stringify(o)
 const micro = (n: number | undefined) => (n === undefined ? n : Math.round(n * 1_000_000)) // в наборе тестов нет toBeCloseTo
@@ -109,6 +109,15 @@ test('погода: цена отправки в остывший кеш — т�
   expect(decide(mark, null, 299_000)).toBe('send')
   expect(decide(mark, null, 301_000)).toBe('hold')
   expect(decide(mark, { at: 301_000, minutes: 5, tokens: 1 }, 400_000)).toBe('confirm')
+})
+
+test('погода: при включённом context-weather Enter придерживает он, Stukach уступает', async () => {
+  // живая настройка владельца 23.11: "context-weather@mod-weather": true
+  expect(weatherModEnabled({ 'context-weather@mod-weather': true, 'stukach@local-mods': true })).toBe(true)
+  expect(weatherModEnabled({ 'context-weather@other-market': true })).toBe(true)
+  expect(weatherModEnabled({ 'context-weather@mod-weather': false })).toBe(false)
+  expect(weatherModEnabled({ 'stukach@local-mods': true })).toBe(false)
+  expect(weatherModEnabled(undefined)).toBe(false)
 })
 
 test('графики: подписаны самый большой и текущий столбцы, у каждого подсказка; на терминале — полосы', async () => {

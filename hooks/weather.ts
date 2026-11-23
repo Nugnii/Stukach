@@ -48,6 +48,13 @@ export function rereadUsd(model: string, count: number, ttl: '5m' | '1h') {
   return { cold: count * perToken * WRITE_SHARE[ttl], warm: count * perToken * r.readShare }
 }
 
+/** Включён ли отдельный мод погоды context-weather (из любого маркетплейса): тогда Enter придерживает он,
+ *  а Stukach уступает — иначе на остывшем кеше Enter пришлось бы нажать трижды, оба мода держат по очереди. */
+export function weatherModEnabled(enabledPlugins: unknown): boolean {
+  if (typeof enabledPlugins !== 'object' || enabledPlugins === null) return false
+  return Object.entries(enabledPlugins).some(([id, isOn]) => isOn === true && id.startsWith('context-weather@'))
+}
+
 export const usd = (n: number) => `$${n < 0.1 ? n.toFixed(3) : n.toFixed(2)}`
 
 export const coldText = (minutes: number, count: number, cost?: { cold: number; warm: number }) =>
